@@ -5,12 +5,18 @@ from __future__ import annotations
 import threading
 import time
 from typing import Optional
+import colorsys
 
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
 import tkinter as tk
 from tkinter import filedialog, ttk, messagebox
+import subprocess
+import sys
+import io
+import os
+import shutil
 
 from net_inspector.config import AppConfig
 from net_inspector.segmenter import Segmenter, render_overlay
@@ -92,6 +98,13 @@ class NetInspectorGUI:
             font=("Segoe UI", 9),
         )
         style.configure(
+            "HsvValue.TLabel",
+            background="#f1f5f9",
+            foreground="#0f172a",
+            font=("Segoe UI", 9, "bold"),
+            padding=(6, 2),
+        )
+        style.configure(
             "TLabelframe",
             background="#ffffff",
             foreground="#0f172a",
@@ -126,6 +139,12 @@ class NetInspectorGUI:
             padding=(4, 2),
         )
         style.map("TCheckbutton", foreground=[("disabled", "#94a3b8")])
+        style.configure(
+            "Hsv.Horizontal.TScale",
+            troughcolor="#e2e8f0",
+            background="#2563eb",
+            sliderlength=14,
+        )
 
     def _build_ui(self) -> None:
         """Build the Tkinter layout.
@@ -203,6 +222,9 @@ class NetInspectorGUI:
         ttk.Button(actions, text="Load image", command=self._on_load).pack(
             side=tk.LEFT, padx=4
         )
+        ttk.Button(actions, text="Paste image", command=self._on_paste).pack(
+            side=tk.LEFT, padx=4
+        )
         ttk.Button(actions, text="Run Segmentation", command=self._on_segment).pack(
             side=tk.LEFT, padx=4
         )
@@ -223,21 +245,62 @@ class NetInspectorGUI:
             side=tk.LEFT, padx=8
         )
 
-        report = ttk.LabelFrame(controls, text="Debris report", padding=8)
-        report.pack(side=tk.LEFT, padx=(0, 12), pady=4)
-        ttk.Label(report, textvariable=self.report_var, style="Status.TLabel").pack(
-            side=tk.LEFT, padx=4
-        )
+        content = ttk.Frame(main, padding=0)
+        content.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
 
-        sliders = ttk.LabelFrame(controls, text="Net HSV", padding=8)
-        sliders.pack(side=tk.LEFT, padx=(0, 12), pady=4)
+        sidebar = ttk.Frame(content)
+        sidebar.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12))
+
+        sliders = ttk.LabelFrame(sidebar, text="Net HSV", padding=8)
+        sliders.pack(fill=tk.X, pady=(0, 8))
         self._add_slider(sliders, "H min", self.h_min_var, 0, 179)
         self._add_slider(sliders, "H max", self.h_max_var, 0, 179)
         self._add_slider(sliders, "S min", self.s_min_var, 0, 255)
         self._add_slider(sliders, "V min", self.v_min_var, 0, 255)
 
-        images = ttk.Frame(main, padding=0)
-        images.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
+        preview = ttk.Frame(sliders)
+        preview.pack(fill=tk.X, pady=(6, 2))
+        ttk.Label(preview, text="Preview", style="Status.TLabel").pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        self._hsv_lower_swatch = tk.Label(
+            preview, width=4, height=2, bg="#22c55e", relief="solid", bd=1
+        )
+        self._hsv_lower_swatch.pack(side=tk.LEFT, padx=(0, 6))
+        self._hsv_lower_text = ttk.Label(preview, text="", style="Status.TLabel")
+        self._hsv_lower_text.pack(side=tk.LEFT, padx=(0, 8))
+        self._hsv_upper_swatch = tk.Label(
+            preview, width=4, height=2, bg="#a7f3d0", relief="solid", bd=1
+        )
+        self._hsv_upper_swatch.pack(side=tk.LEFT, padx=(0, 6))
+        self._hsv_upper_text = ttk.Label(preview, text="", style="Status.TLabel")
+        self._hsv_upper_text.pack(side=tk.LEFT)
+        self._hsv_gradient = tk.Canvas(
+            sliders, width=180, height=10, highlightthickness=0, bg="#ffffff"
+        )
+        self._hsv_gradient.pack(fill=tk.X, pady=(2, 0))
+
+        self.h_min_var.trace_add("write", self._on_hsv_change)
+        self.h_max_var.trace_add("write", self._on_hsv_change)
+        self.s_min_var.trace_add("write", self._on_hsv_change)
+        self.v_min_var.trace_add("write", self._on_hsv_change)
+        self._draw_hsv_gradient()
+        self._update_hsv_preview()
+
+        legend_box = ttk.LabelFrame(sidebar, text="Segmentation legend", padding=8)
+        legend_box.pack(fill=tk.X, pady=(0, 8))
+        ttk.Checkbutton(legend_box, text="Show legend", variable=self.var_legend).pack(
+            side=tk.LEFT, padx=4
+        )
+
+        report_box = ttk.LabelFrame(sidebar, text="Debris report", padding=8)
+        report_box.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(report_box, textvariable=self.report_var, style="Status.TLabel").pack(
+            side=tk.LEFT, padx=4
+        )
+
+        images = ttk.Frame(content, padding=0)
+        images.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         input_frame = ttk.LabelFrame(images, text="Input", padding=8)
         input_frame.pack(side=tk.LEFT, padx=(0, 12), fill=tk.BOTH, expand=True)
         output_frame = ttk.LabelFrame(images, text="Segmentation output", padding=8)
@@ -277,6 +340,7 @@ class NetInspectorGUI:
 
         @return None
         """
+        self._stop_camera()
         result = generate_demo_image(
             add_debris=self.var_debris.get(),
             add_tear=self.var_tear.get(),
@@ -293,6 +357,7 @@ class NetInspectorGUI:
 
         @return None
         """
+        self._stop_camera()
         path = filedialog.askopenfilename(
             title="Select image",
             filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp"), ("All", "*.*")],
@@ -302,6 +367,25 @@ class NetInspectorGUI:
         image = cv2.imread(path)
         if image is None:
             messagebox.showerror("Error", "Failed to load image")
+            return
+        self.current_image = image
+        self.segmented_image = None
+        self._set_image(self.input_label, self.current_image)
+        self._clear_output()
+
+    def _on_paste(self) -> None:
+        """Paste image from clipboard and show it.
+
+        @return None
+        """
+        self._stop_camera()
+        image = self._load_clipboard_image()
+        if image is None:
+            messagebox.showwarning(
+                "Clipboard",
+                "No image found in clipboard. Install xclip (X11) or wl-clipboard (Wayland), "
+                "or copy an image file path and try again.",
+            )
             return
         self.current_image = image
         self.segmented_image = None
@@ -371,6 +455,7 @@ class NetInspectorGUI:
         self._stop_event.set()
         self.var_camera.set(False)
         self._fps = 0.0
+        self._seg_fps = 0.0
         if self._camera_thread and self._camera_thread.is_alive():
             self._camera_thread.join(timeout=1.0)
         if self._segment_thread and self._segment_thread.is_alive():
@@ -378,6 +463,7 @@ class NetInspectorGUI:
         with self._frame_lock:
             self._latest_frame = None
             self._latest_seg = None
+            self._seg_frame_id = -1
 
     def _camera_loop(self) -> None:
         """Camera capture loop (runs on its own thread).
@@ -454,10 +540,16 @@ class NetInspectorGUI:
         camera = self._camera_status_text()
         extra = f" | {self._extra_status}" if self._extra_status else ""
         self.status_var.set(f"{base} | {camera}{extra}")
-        if self._latest_frame is not None:
-            self._set_image(self.input_label, self._latest_frame)
-        if self._latest_seg is not None:
-            self._set_image(self.output_label, self._latest_seg)
+        if self._camera_running:
+            if self._latest_frame is not None:
+                self._set_image(self.input_label, self._latest_frame)
+            if self._latest_seg is not None:
+                self._set_image(self.output_label, self._latest_seg)
+        else:
+            if self.current_image is not None:
+                self._set_image(self.input_label, self.current_image)
+            if self.segmented_image is not None:
+                self._set_image(self.output_label, self.segmented_image)
         self.root.after(50, self._start_ui_loop)
 
     def _set_image(self, label: ttk.Label, image_bgr: np.ndarray) -> None:
@@ -492,6 +584,100 @@ class NetInspectorGUI:
         stamp = timestamp_id()
         out_path = self.config.outputs_annotated / f"seg_{stamp}.jpg"
         save_image(out_path, overlay)
+
+    def _load_clipboard_image(self) -> Optional[np.ndarray]:
+        """Load image from clipboard (Linux/macOS).
+
+        @return Image in BGR or None.
+        """
+        # Try PIL ImageGrab (works on Windows/macOS, sometimes on Linux).
+        try:
+            from PIL import ImageGrab
+
+            grabbed = ImageGrab.grabclipboard()
+            if grabbed is not None:
+                if isinstance(grabbed, Image.Image):
+                    return cv2.cvtColor(np.array(grabbed), cv2.COLOR_RGB2BGR)
+                if isinstance(grabbed, list):
+                    for item in grabbed:
+                        if isinstance(item, str) and os.path.exists(item):
+                            image = cv2.imread(item)
+                            if image is not None:
+                                return image
+        except Exception:
+            pass
+
+        # Try Tk clipboard first (may only give text on some platforms).
+        try:
+            data = self.root.clipboard_get()
+            if isinstance(data, str):
+                # Clipboard might contain a file path.
+                candidate = data.strip().strip("\"'")
+                if os.path.exists(candidate):
+                    image = cv2.imread(candidate)
+                    if image is not None:
+                        return image
+        except Exception:
+            pass
+
+        # Linux: Wayland clipboard via wl-paste
+        if sys.platform.startswith("linux") and os.environ.get("WAYLAND_DISPLAY"):
+            if shutil.which("wl-paste"):
+                try:
+                    proc = subprocess.run(
+                        ["bash", "-lc", "wl-paste --type image/png"],
+                        capture_output=True,
+                        check=True,
+                    )
+                    if proc.stdout:
+                        image = Image.open(io.BytesIO(proc.stdout))
+                        return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+                except Exception:
+                    pass
+
+        # Linux: use xclip if available (X11)
+        if sys.platform.startswith("linux") and shutil.which("xclip"):
+            try:
+                proc = subprocess.run(
+                    ["bash", "-lc", "xclip -selection clipboard -t image/png -o"],
+                    capture_output=True,
+                    check=True,
+                )
+                if proc.stdout:
+                    image = Image.open(io.BytesIO(proc.stdout))
+                    return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            except Exception:
+                pass
+
+        # Linux: use xsel if available (X11)
+        if sys.platform.startswith("linux") and shutil.which("xsel"):
+            try:
+                proc = subprocess.run(
+                    ["bash", "-lc", "xsel --clipboard --output --output"],
+                    capture_output=True,
+                    check=True,
+                )
+                if proc.stdout:
+                    image = Image.open(io.BytesIO(proc.stdout))
+                    return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            except Exception:
+                pass
+
+        # macOS: use pngpaste if available
+        if sys.platform == "darwin":
+            try:
+                proc = subprocess.run(
+                    ["bash", "-lc", "pngpaste -"],
+                    capture_output=True,
+                    check=True,
+                )
+                if proc.stdout:
+                    image = Image.open(io.BytesIO(proc.stdout))
+                    return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            except Exception:
+                pass
+
+        return None
 
     def _apply_extra_overlays(
         self, overlay: np.ndarray, image_bgr: np.ndarray
@@ -612,17 +798,94 @@ class NetInspectorGUI:
         row = ttk.Frame(parent)
         row.pack(fill=tk.X, pady=2)
         ttk.Label(row, text=label, style="Status.TLabel").pack(side=tk.LEFT)
-        scale = tk.Scale(
+        value_var = tk.StringVar(value=str(var.get()))
+        value_label = ttk.Label(row, textvariable=value_var, style="HsvValue.TLabel")
+        value_label.pack(side=tk.RIGHT, padx=(6, 0))
+
+        def _sync_value(*_args) -> None:
+            value_var.set(str(var.get()))
+
+        def _on_scale(value: str) -> None:
+            var.set(int(float(value)))
+            value_var.set(str(var.get()))
+
+        scale = ttk.Scale(
             row,
             from_=minimum,
             to=maximum,
             orient=tk.HORIZONTAL,
             variable=var,
-            length=120,
-            showvalue=True,
-            resolution=1,
+            command=_on_scale,
+            style="Hsv.Horizontal.TScale",
         )
-        scale.pack(side=tk.LEFT, padx=6)
+        scale.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=6)
+        var.trace_add("write", _sync_value)
+
+    def _on_hsv_change(self, *_args) -> None:
+        h_min = self.h_min_var.get()
+        h_max = self.h_max_var.get()
+        if h_min > h_max:
+            self.h_max_var.set(h_min)
+            return
+        self._update_hsv_preview()
+
+    def _hsv_to_hex(self, h: int, s: int, v: int) -> str:
+        h_norm = max(0.0, min(1.0, h / 179.0))
+        s_norm = max(0.0, min(1.0, s / 255.0))
+        v_norm = max(0.0, min(1.0, v / 255.0))
+        r, g, b = colorsys.hsv_to_rgb(h_norm, s_norm, v_norm)
+        return f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
+
+    def _hsv_to_rgb(self, h: int, s: int, v: int) -> tuple[int, int, int]:
+        h_norm = max(0.0, min(1.0, h / 179.0))
+        s_norm = max(0.0, min(1.0, s / 255.0))
+        v_norm = max(0.0, min(1.0, v / 255.0))
+        r, g, b = colorsys.hsv_to_rgb(h_norm, s_norm, v_norm)
+        return int(r * 255), int(g * 255), int(b * 255)
+
+    def _draw_hsv_gradient(self) -> None:
+        self._hsv_gradient.delete("all")
+        width = int(self._hsv_gradient["width"])
+        for x in range(width):
+            h = int(179 * x / max(1, width - 1))
+            color = self._hsv_to_hex(h, 255, 255)
+            self._hsv_gradient.create_line(x, 0, x, 10, fill=color)
+
+    def _update_hsv_preview(self) -> None:
+        h_min = self.h_min_var.get()
+        h_max = self.h_max_var.get()
+        s_min = self.s_min_var.get()
+        v_min = self.v_min_var.get()
+        lower_color = self._hsv_to_hex(h_min, s_min, v_min)
+        upper_color = self._hsv_to_hex(h_max, 255, 255)
+        self._hsv_lower_swatch.configure(bg=lower_color)
+        self._hsv_upper_swatch.configure(bg=upper_color)
+        lower_rgb = self._hsv_to_rgb(h_min, s_min, v_min)
+        upper_rgb = self._hsv_to_rgb(h_max, 255, 255)
+        self._hsv_lower_text.configure(
+            text=(
+                f"H:{h_min} S:{s_min} V:{v_min}\n"
+                f"{lower_color.upper()}\n"
+                f"RGB{lower_rgb}"
+            )
+        )
+        self._hsv_upper_text.configure(
+            text=(
+                f"H:{h_max} S:255 V:255\n"
+                f"{upper_color.upper()}\n"
+                f"RGB{upper_rgb}"
+            )
+        )
+
+        self._hsv_gradient.delete("marker")
+        width = int(self._hsv_gradient["width"])
+        def _x_from_h(h: int) -> int:
+            return int((h / 179.0) * max(1, width - 1))
+
+        x_min = _x_from_h(h_min)
+        x_max = _x_from_h(h_max)
+        self._hsv_gradient.create_line(x_min, 0, x_min, 10, fill="#0f172a", tags="marker")
+        self._hsv_gradient.create_line(x_max, 0, x_max, 10, fill="#0f172a", tags="marker")
 
     def _on_close(self) -> None:
         """Handle window close event.

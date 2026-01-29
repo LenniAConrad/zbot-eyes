@@ -70,6 +70,10 @@ python -m net_inspector.gui
 
 - Segmentation overlays: `outputs/annotated/`
 
+## Docs
+
+- Clipboard paste guide: `docs/clipboard.md`
+
 ## Notes
 
 - Segmentation uses DeepLabV3 ResNet-50 weights (VOC 21 labels).
