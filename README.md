@@ -61,6 +61,7 @@ python -m net_inspector.gui
 - Toggle Legend to show/hide segmentation labels.
 - Stop the camera before loading or generating demo images.
 - Use the ChatGLM pane on the right to analyze the current frame and view markdown output.
+- Use the Incident Queue controls to create, triage, and export grounded incident reports.
 
 ## ChatGLM Vision Setup
 
@@ -74,6 +75,24 @@ python -m net_inspector.gui
 3. In the GUI, click **Analyze current frame** in the ChatGLM pane.
 
 The default model endpoint is Open BigModel Chat Completions with `glm-4v-flash` and can be adjusted in `src/net_inspector/config.py`.
+
+## Grounded Incident Reports (RGB + Thermal)
+
+The right pane now supports a lightweight reporting workflow:
+
+1. Optionally load a thermal image with **Load thermal image**.
+2. Fill metadata (`Distance`, `Position`, `Pose`, confidence slider).
+3. Click **Create incident** to capture evidence-backed incident records.
+4. Select an incident in the queue and set disposition: `accepted`, `needs_review`, or `rejected`.
+5. Run ChatGLM while an incident is selected to attach an evidence-tagged summary.
+6. Click **Export selected** to write:
+   - `outputs/incidents/<incident_id>/report.json`
+   - `outputs/incidents/<incident_id>/report.md`
+
+Grounding rules:
+- Observation claims are linked to explicit evidence IDs (`[EVID:...]`).
+- LLM summaries are accepted only if each sentence references valid evidence IDs.
+- Ungrounded summaries are rejected at attach/export time.
 
 ## Live Camera Tips
 

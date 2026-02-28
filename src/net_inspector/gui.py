@@ -22,6 +22,7 @@ import shutil
 
 from net_inspector.config import AppConfig
 from net_inspector.llm_glm import ChatGLMVisionClient
+from net_inspector.reporting import IncidentStore
 from net_inspector.segmenter import Segmenter, render_overlay
 from net_inspector.synth.generate import generate_demo_image
 from net_inspector.utils.io import ensure_dir, save_image, timestamp_id
@@ -38,12 +39,17 @@ class NetInspectorGUI:
         self.config = AppConfig()
         self.segmenter = Segmenter()
         self.glm_client = ChatGLMVisionClient(self.config.glm_vision)
+        self.incident_store = IncidentStore(
+            output_dir=self.config.outputs_incidents,
+            model_version="net-inspector/gui-v1",
+        )
 
         self.root = tk.Tk()
         self.root.title("Net Inspector")
         self.root.minsize(1040, 720)
 
         self.current_image: Optional[np.ndarray] = None
+        self.current_thermal_image: Optional[np.ndarray] = None
         self.segmented_image: Optional[np.ndarray] = None
 
         self._camera_thread: Optional[threading.Thread] = None
@@ -64,6 +70,8 @@ class NetInspectorGUI:
         self._llm_thread: Optional[threading.Thread] = None
         self._llm_busy = False
         self._md_fonts: list[tkfont.Font] = []
+        self._incident_ids: list[str] = []
+        self._selected_incident_id: Optional[str] = None
 
         self._apply_style()
         self._build_ui()
@@ -179,6 +187,11 @@ class NetInspectorGUI:
         self.report_var = tk.StringVar(value="Debris: 0.0%")
         self.glm_prompt_var = tk.StringVar(value=self.config.glm_vision.default_prompt)
         self.glm_status_var = tk.StringVar(value=self._glm_status_text())
+        self.incident_status_var = tk.StringVar(value="Incidents: 0")
+        self.incident_distance_var = tk.StringVar(value="")
+        self.incident_position_var = tk.StringVar(value="")
+        self.incident_pose_var = tk.StringVar(value="")
+        self.incident_conf_var = tk.DoubleVar(value=0.65)
 
         self.h_min_var = tk.IntVar(value=self.config.heuristic.green_h_min)
         self.h_max_var = tk.IntVar(value=self.config.heuristic.green_h_max)
@@ -352,6 +365,82 @@ class NetInspectorGUI:
             side=tk.LEFT, fill=tk.X, expand=True
         )
 
+        incident_row = ttk.LabelFrame(llm_frame, text="Incident capture", padding=6)
+        incident_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(
+            incident_row, text="Load thermal image", command=self._on_load_thermal
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            incident_row, text="Create incident", command=self._on_create_incident
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            incident_row, text="Export selected", command=self._on_export_incident
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(
+            incident_row, textvariable=self.incident_status_var, style="Status.TLabel"
+        ).pack(side=tk.RIGHT)
+
+        incident_meta = ttk.Frame(llm_frame)
+        incident_meta.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(incident_meta, text="Distance(m)", style="Status.TLabel").pack(
+            side=tk.LEFT
+        )
+        ttk.Entry(
+            incident_meta, width=7, textvariable=self.incident_distance_var
+        ).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(incident_meta, text="Position", style="Status.TLabel").pack(side=tk.LEFT)
+        ttk.Entry(
+            incident_meta, width=16, textvariable=self.incident_position_var
+        ).pack(side=tk.LEFT, padx=(4, 8))
+        ttk.Label(incident_meta, text="Pose", style="Status.TLabel").pack(side=tk.LEFT)
+        ttk.Entry(incident_meta, width=16, textvariable=self.incident_pose_var).pack(
+            side=tk.LEFT, padx=(4, 8)
+        )
+        ttk.Label(incident_meta, text="Conf", style="Status.TLabel").pack(side=tk.LEFT)
+        ttk.Scale(
+            incident_meta,
+            from_=0.0,
+            to=1.0,
+            orient=tk.HORIZONTAL,
+            variable=self.incident_conf_var,
+            length=90,
+            style="Hsv.Horizontal.TScale",
+        ).pack(side=tk.LEFT, padx=(4, 0))
+
+        incident_queue = ttk.LabelFrame(llm_frame, text="Incident queue", padding=6)
+        incident_queue.pack(fill=tk.X, pady=(0, 6))
+        queue_body = ttk.Frame(incident_queue)
+        queue_body.pack(fill=tk.X)
+        queue_scroll = ttk.Scrollbar(queue_body, orient=tk.VERTICAL)
+        queue_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.incident_listbox = tk.Listbox(
+            queue_body,
+            height=5,
+            yscrollcommand=queue_scroll.set,
+            exportselection=False,
+        )
+        self.incident_listbox.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.incident_listbox.bind("<<ListboxSelect>>", self._on_incident_select)
+        queue_scroll.configure(command=self.incident_listbox.yview)
+
+        triage_row = ttk.Frame(incident_queue)
+        triage_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(
+            triage_row,
+            text="Accept",
+            command=lambda: self._on_set_disposition("accepted"),
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            triage_row,
+            text="Needs review",
+            command=lambda: self._on_set_disposition("needs_review"),
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            triage_row,
+            text="Reject",
+            command=lambda: self._on_set_disposition("rejected"),
+        ).pack(side=tk.LEFT)
+
         markdown_container = ttk.Frame(llm_frame)
         markdown_container.pack(fill=tk.BOTH, expand=True)
         markdown_scroll = ttk.Scrollbar(markdown_container, orient=tk.VERTICAL)
@@ -372,10 +461,12 @@ class NetInspectorGUI:
         self._set_markdown(
             "# ChatGLM Vision\n\n"
             "Click **Analyze current frame** to send the latest image.\n\n"
+            "Use incident controls to create/export grounded reports.\n\n"
             "API key sources:\n"
             "- `CHATGLM_API_KEY`\n"
             f"- `{self.config.glm_vision.api_key_file}`"
         )
+        self._refresh_incident_queue()
 
     def _segment_status_text(self) -> str:
         """Return segmentation status string with FPS.
@@ -503,6 +594,17 @@ class NetInspectorGUI:
             return
 
         prompt = self.glm_prompt_var.get().strip()
+        if self._selected_incident_id:
+            report = self.incident_store.get(self._selected_incident_id)
+            if report is not None:
+                evidence_ids = [item.evidence_id for item in report.evidence]
+                if evidence_ids:
+                    prompt = (
+                        f"{prompt}\n\n"
+                        "Grounding constraint: every sentence must include one evidence tag in "
+                        "the format [EVID:<id>]. Use only these IDs: "
+                        f"{', '.join(evidence_ids)}."
+                    )
         self._llm_busy = True
         self.glm_status_var.set(self._glm_status_text())
         self._set_markdown("## Running ChatGLM request\n\nPlease wait...")
@@ -541,12 +643,160 @@ class NetInspectorGUI:
     def _on_glm_result(self, markdown: str) -> None:
         self._llm_busy = False
         self.glm_status_var.set(self._glm_status_text())
+        if self._selected_incident_id:
+            try:
+                errors = self.incident_store.attach_llm_summary(
+                    self._selected_incident_id, markdown
+                )
+            except Exception as exc:
+                self.glm_status_var.set("GLM: Attach failed")
+                self._set_markdown(f"## Failed to attach summary\n\n```\n{exc}\n```")
+                return
+            if errors:
+                self.glm_status_var.set("GLM: Ungrounded response")
+                preview = "\n".join(f"- {err}" for err in errors[:8])
+                self._set_markdown(
+                    "## ChatGLM response rejected (grounding check)\n\n"
+                    "Each sentence must include valid `[EVID:...]` references.\n\n"
+                    f"{markdown}\n\nValidation errors:\n{preview}"
+                )
+                return
+            self.glm_status_var.set("GLM: Attached to incident")
+            report = self.incident_store.get(self._selected_incident_id)
+            if report is not None:
+                self._set_markdown(self.incident_store.to_markdown(report))
+            return
         self._set_markdown(markdown)
 
     def _on_glm_error(self, error_text: str) -> None:
         self._llm_busy = False
         self.glm_status_var.set("GLM: Request failed")
         self._set_markdown(f"## ChatGLM request failed\n\n```\n{error_text}\n```")
+
+    def _on_load_thermal(self) -> None:
+        """Load a thermal/IR image to pair with new incidents."""
+        path = filedialog.askopenfilename(
+            title="Select thermal image",
+            filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp"), ("All", "*.*")],
+        )
+        if not path:
+            return
+        image = cv2.imread(path)
+        if image is None:
+            messagebox.showerror("Error", "Failed to load thermal image")
+            return
+        self.current_thermal_image = image
+        self.incident_status_var.set("Thermal image loaded")
+
+    def _on_create_incident(self) -> None:
+        """Create a grounded incident from the current capture context."""
+        rgb_image = self._select_glm_image()
+        if rgb_image is None:
+            messagebox.showwarning("No image", "Load image or enable camera first.")
+            return
+        distance = self._parse_optional_float(self.incident_distance_var.get())
+        position_hint = self.incident_position_var.get().strip()
+        robot_pose = self.incident_pose_var.get().strip()
+        confidence = float(max(0.0, min(1.0, self.incident_conf_var.get())))
+
+        report = self.incident_store.create_incident(
+            rgb_frame=rgb_image,
+            thermal_frame=self.current_thermal_image.copy()
+            if self.current_thermal_image is not None
+            else None,
+            label="wall_anomaly",
+            confidence=confidence,
+            severity="medium",
+            estimated_distance_m=distance,
+            position_hint=position_hint,
+            robot_pose=robot_pose,
+            metadata={
+                "camera_running": self._camera_running,
+                "segmentation_fps": round(self._seg_fps, 2),
+                "camera_fps": round(self._fps, 2),
+            },
+        )
+        self._refresh_incident_queue(select_incident_id=report.incident_id)
+        self._set_markdown(self.incident_store.to_markdown(report))
+        self.incident_status_var.set(f"Incident created: {report.incident_id}")
+
+    def _on_incident_select(self, _event=None) -> None:
+        selection = self.incident_listbox.curselection()
+        if not selection:
+            self._selected_incident_id = None
+            return
+        idx = int(selection[0])
+        if idx < 0 or idx >= len(self._incident_ids):
+            self._selected_incident_id = None
+            return
+        incident_id = self._incident_ids[idx]
+        self._selected_incident_id = incident_id
+        report = self.incident_store.get(incident_id)
+        if report is not None:
+            self._set_markdown(self.incident_store.to_markdown(report))
+
+    def _on_set_disposition(self, disposition: str) -> None:
+        """Set disposition for selected incident."""
+        if not self._selected_incident_id:
+            messagebox.showinfo("No selection", "Select an incident first.")
+            return
+        self.incident_store.set_disposition(self._selected_incident_id, disposition)
+        report = self.incident_store.get(self._selected_incident_id)
+        if report is not None:
+            self._set_markdown(self.incident_store.to_markdown(report))
+        self._refresh_incident_queue(select_incident_id=self._selected_incident_id)
+
+    def _on_export_incident(self) -> None:
+        """Export selected incident as JSON + markdown."""
+        if not self._selected_incident_id:
+            messagebox.showinfo("No selection", "Select an incident first.")
+            return
+        try:
+            json_path, md_path = self.incident_store.export_incident(
+                self._selected_incident_id
+            )
+        except Exception as exc:
+            messagebox.showerror("Export failed", str(exc))
+            return
+        self.incident_status_var.set(f"Exported: {self._selected_incident_id}")
+        messagebox.showinfo(
+            "Export complete",
+            f"JSON: {json_path}\nMarkdown: {md_path}",
+        )
+
+    def _refresh_incident_queue(self, select_incident_id: Optional[str] = None) -> None:
+        reports = self.incident_store.all()
+        self.incident_listbox.delete(0, tk.END)
+        self._incident_ids = []
+        for report in reports:
+            score = report.risk_score()
+            suffix = report.incident_id.replace("INC_", "")[-12:]
+            label = (
+                f"{suffix} | {report.operator_disposition} | "
+                f"risk {score:.2f} | evid {len(report.evidence)}"
+            )
+            self._incident_ids.append(report.incident_id)
+            self.incident_listbox.insert(tk.END, label)
+
+        self.incident_status_var.set(f"Incidents: {len(reports)}")
+        target_id = select_incident_id or self._selected_incident_id
+        if target_id and target_id in self._incident_ids:
+            idx = self._incident_ids.index(target_id)
+            self.incident_listbox.selection_clear(0, tk.END)
+            self.incident_listbox.selection_set(idx)
+            self.incident_listbox.activate(idx)
+            self._selected_incident_id = target_id
+        elif not reports:
+            self._selected_incident_id = None
+
+    def _parse_optional_float(self, value: str) -> Optional[float]:
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return None
 
     def _toggle_camera(self) -> None:
         """Toggle live camera on/off.

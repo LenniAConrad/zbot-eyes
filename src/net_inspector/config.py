@@ -122,6 +122,7 @@ class AppConfig:
     @field events_log_path Realtime JSONL log path.
     @field outputs_annotated Annotated output directory.
     @field outputs_raw Raw output directory.
+    @field outputs_incidents Incident report output directory.
     """
 
     heuristic: HeuristicConfig = HeuristicConfig()
@@ -133,3 +134,4 @@ class AppConfig:
     events_log_path: Path = LOG_DIR / "events.jsonl"
     outputs_annotated: Path = OUTPUT_DIR / "annotated"
     outputs_raw: Path = OUTPUT_DIR / "raw"
+    outputs_incidents: Path = OUTPUT_DIR / "incidents"
