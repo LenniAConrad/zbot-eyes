@@ -7,6 +7,7 @@ This repository provides a segmentation-first vision GUI for the scaffolding-net
 - Segmentation-first workflow (PyTorch)
 - GUI-only operation
 - Live camera + segmentation run on separate threads
+- ChatGLM vision pane with markdown output
 
 ## GUI Preview
 
@@ -59,6 +60,20 @@ python -m net_inspector.gui
 - Use the Net HSV sliders to tune green thresholds at runtime.
 - Toggle Legend to show/hide segmentation labels.
 - Stop the camera before loading or generating demo images.
+- Use the ChatGLM pane on the right to analyze the current frame and view markdown output.
+
+## ChatGLM Vision Setup
+
+1. Add your API key to `secrets/chatglm_api_key.txt` (single line), or export `CHATGLM_API_KEY`.
+2. Start GUI:
+
+```bash
+python -m net_inspector.gui
+```
+
+3. In the GUI, click **Analyze current frame** in the ChatGLM pane.
+
+The default model endpoint is Open BigModel Chat Completions with `glm-4v-flash` and can be adjusted in `src/net_inspector/config.py`.
 
 ## Live Camera Tips
 

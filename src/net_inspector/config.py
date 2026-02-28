@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -12,6 +12,7 @@ OUTPUT_DIR = ROOT_DIR / "outputs"
 LOG_DIR = ROOT_DIR / "logs"
 MODELS_DIR = ROOT_DIR / "models"
 ASSETS_DIR = ROOT_DIR / "assets"
+SECRETS_DIR = ROOT_DIR / "secrets"
 
 
 @dataclass(frozen=True)
@@ -89,12 +90,34 @@ class HeuristicConfig:
 
 
 @dataclass(frozen=True)
+class GLMVisionConfig:
+    """Configuration for ChatGLM vision API usage.
+
+    @field endpoint Chat completion endpoint.
+    @field model ChatGLM vision-capable model name.
+    @field api_key_file Text file that stores API key.
+    @field timeout_s Request timeout in seconds.
+    @field default_prompt Default instruction prompt for visual analysis.
+    """
+
+    endpoint: str = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+    model: str = "glm-4v-flash"
+    api_key_file: Path = SECRETS_DIR / "chatglm_api_key.txt"
+    timeout_s: float = 45.0
+    default_prompt: str = (
+        "Analyze this image for net inspection. Return a concise markdown report with sections: "
+        "Summary, Observations, Risks, and Suggested next actions."
+    )
+
+
+@dataclass(frozen=True)
 class AppConfig:
     """Top-level application configuration.
 
     @field heuristic HeuristicConfig.
     @field fire_classifier FireClassifierConfig.
     @field object_detector ObjectDetectorConfig.
+    @field glm_vision GLMVisionConfig.
     @field log_path Default JSONL log path.
     @field events_log_path Realtime JSONL log path.
     @field outputs_annotated Annotated output directory.
@@ -104,6 +127,7 @@ class AppConfig:
     heuristic: HeuristicConfig = HeuristicConfig()
     fire_classifier: FireClassifierConfig = FireClassifierConfig()
     object_detector: ObjectDetectorConfig = ObjectDetectorConfig()
+    glm_vision: GLMVisionConfig = field(default_factory=GLMVisionConfig)
 
     log_path: Path = LOG_DIR / "detections.jsonl"
     events_log_path: Path = LOG_DIR / "events.jsonl"

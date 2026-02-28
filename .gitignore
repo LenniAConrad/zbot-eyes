@@ -48,3 +48,8 @@ Thumbs.db
 
 # Misc
 *.log
+
+# Secrets
+secrets/*
+!secrets/.gitkeep
+!secrets/README.md

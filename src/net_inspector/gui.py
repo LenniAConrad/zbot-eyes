@@ -6,11 +6,13 @@ import threading
 import time
 from typing import Optional
 import colorsys
+import re
 
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, ttk, messagebox
 import subprocess
 import sys
@@ -19,6 +21,7 @@ import os
 import shutil
 
 from net_inspector.config import AppConfig
+from net_inspector.llm_glm import ChatGLMVisionClient
 from net_inspector.segmenter import Segmenter, render_overlay
 from net_inspector.synth.generate import generate_demo_image
 from net_inspector.utils.io import ensure_dir, save_image, timestamp_id
@@ -27,9 +30,14 @@ from net_inspector.utils.io import ensure_dir, save_image, timestamp_id
 class NetInspectorGUI:
     """Segmentation-first GUI with optional live camera."""
 
+    _INLINE_TOKEN_RE = re.compile(
+        r"(`[^`]+`|\*\*[^*\n]+\*\*|__[^_\n]+__|\*[^*\n]+\*|_[^_\n]+_|!\[[^\]]*\]\([^)]+\)|\[[^\]]+\]\([^)]+\))"
+    )
+
     def __init__(self) -> None:
         self.config = AppConfig()
         self.segmenter = Segmenter()
+        self.glm_client = ChatGLMVisionClient(self.config.glm_vision)
 
         self.root = tk.Tk()
         self.root.title("Net Inspector")
@@ -53,6 +61,9 @@ class NetInspectorGUI:
         self._fps = 0.0
         self._fps_last_time = time.time()
         self._fps_count = 0
+        self._llm_thread: Optional[threading.Thread] = None
+        self._llm_busy = False
+        self._md_fonts: list[tkfont.Font] = []
 
         self._apply_style()
         self._build_ui()
@@ -166,6 +177,8 @@ class NetInspectorGUI:
         self.status_var = tk.StringVar(value=self._segment_status_text())
         self._extra_status = ""
         self.report_var = tk.StringVar(value="Debris: 0.0%")
+        self.glm_prompt_var = tk.StringVar(value=self.config.glm_vision.default_prompt)
+        self.glm_status_var = tk.StringVar(value=self._glm_status_text())
 
         self.h_min_var = tk.IntVar(value=self.config.heuristic.green_h_min)
         self.h_max_var = tk.IntVar(value=self.config.heuristic.green_h_max)
@@ -305,6 +318,8 @@ class NetInspectorGUI:
         input_frame.pack(side=tk.LEFT, padx=(0, 12), fill=tk.BOTH, expand=True)
         output_frame = ttk.LabelFrame(images, text="Segmentation output", padding=8)
         output_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        llm_frame = ttk.LabelFrame(images, text="ChatGLM Vision (Markdown)", padding=8)
+        llm_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self.input_label = ttk.Label(
             input_frame, text="No image loaded", anchor=tk.CENTER, justify=tk.CENTER
@@ -317,6 +332,50 @@ class NetInspectorGUI:
             justify=tk.CENTER,
         )
         self.output_label.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+
+        llm_toolbar = ttk.Frame(llm_frame)
+        llm_toolbar.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(
+            llm_toolbar, text="Analyze current frame", command=self._on_glm_analyze
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(llm_toolbar, text="Clear", command=self._on_glm_clear).pack(side=tk.LEFT)
+        ttk.Label(
+            llm_toolbar, textvariable=self.glm_status_var, style="Status.TLabel"
+        ).pack(side=tk.RIGHT)
+
+        prompt_row = ttk.Frame(llm_frame)
+        prompt_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(prompt_row, text="Prompt", style="Status.TLabel").pack(
+            side=tk.LEFT, padx=(0, 6)
+        )
+        ttk.Entry(prompt_row, textvariable=self.glm_prompt_var).pack(
+            side=tk.LEFT, fill=tk.X, expand=True
+        )
+
+        markdown_container = ttk.Frame(llm_frame)
+        markdown_container.pack(fill=tk.BOTH, expand=True)
+        markdown_scroll = ttk.Scrollbar(markdown_container, orient=tk.VERTICAL)
+        markdown_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.markdown_text = tk.Text(
+            markdown_container,
+            wrap=tk.WORD,
+            yscrollcommand=markdown_scroll.set,
+            bg="#ffffff",
+            fg="#0f172a",
+            relief="flat",
+            padx=8,
+            pady=8,
+        )
+        self.markdown_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        markdown_scroll.configure(command=self.markdown_text.yview)
+        self._setup_markdown_tags()
+        self._set_markdown(
+            "# ChatGLM Vision\n\n"
+            "Click **Analyze current frame** to send the latest image.\n\n"
+            "API key sources:\n"
+            "- `CHATGLM_API_KEY`\n"
+            f"- `{self.config.glm_vision.api_key_file}`"
+        )
 
     def _segment_status_text(self) -> str:
         """Return segmentation status string with FPS.
@@ -334,6 +393,14 @@ class NetInspectorGUI:
         cam_state = "On" if self._camera_running else "Off"
         fps_part = f" | {self._fps:.1f} FPS" if self._camera_running else ""
         return f"Camera: {cam_state}{fps_part}"
+
+    def _glm_status_text(self) -> str:
+        """Return ChatGLM status string."""
+        if self._llm_busy:
+            return "GLM: Running..."
+        if self.glm_client.available():
+            return f"GLM: Ready ({self.config.glm_vision.model})"
+        return "GLM: API key missing"
 
     def _on_generate(self) -> None:
         """Generate a synthetic demo image and show it.
@@ -418,6 +485,68 @@ class NetInspectorGUI:
         self.segmented_image = overlay
         self._set_image(self.output_label, self.segmented_image)
         self._save_segmentation(self.segmented_image)
+
+    def _on_glm_analyze(self) -> None:
+        """Analyze current frame/image with ChatGLM vision."""
+        if self._llm_busy:
+            return
+        image = self._select_glm_image()
+        if image is None:
+            messagebox.showwarning("No image", "Load image or enable camera before GLM analysis.")
+            return
+        if not self.glm_client.available():
+            self.glm_status_var.set(self._glm_status_text())
+            messagebox.showwarning(
+                "Missing API key",
+                "Set CHATGLM_API_KEY or create secrets/chatglm_api_key.txt first.",
+            )
+            return
+
+        prompt = self.glm_prompt_var.get().strip()
+        self._llm_busy = True
+        self.glm_status_var.set(self._glm_status_text())
+        self._set_markdown("## Running ChatGLM request\n\nPlease wait...")
+        self._llm_thread = threading.Thread(
+            target=self._glm_worker, args=(image, prompt), daemon=True
+        )
+        self._llm_thread.start()
+
+    def _on_glm_clear(self) -> None:
+        """Clear markdown pane."""
+        self._set_markdown("")
+        self.glm_status_var.set(self._glm_status_text())
+
+    def _select_glm_image(self) -> Optional[np.ndarray]:
+        """Select best available frame for LLM analysis."""
+        with self._frame_lock:
+            if self._camera_running and self._latest_frame is not None:
+                return self._latest_frame.copy()
+        if self.current_image is not None:
+            return self.current_image.copy()
+        if self.segmented_image is not None:
+            return self.segmented_image.copy()
+        with self._frame_lock:
+            if self._latest_seg is not None:
+                return self._latest_seg.copy()
+        return None
+
+    def _glm_worker(self, image: np.ndarray, prompt: str) -> None:
+        try:
+            markdown = self.glm_client.infer_markdown(image, prompt)
+        except Exception as exc:
+            self.root.after(0, lambda: self._on_glm_error(str(exc)))
+            return
+        self.root.after(0, lambda: self._on_glm_result(markdown))
+
+    def _on_glm_result(self, markdown: str) -> None:
+        self._llm_busy = False
+        self.glm_status_var.set(self._glm_status_text())
+        self._set_markdown(markdown)
+
+    def _on_glm_error(self, error_text: str) -> None:
+        self._llm_busy = False
+        self.glm_status_var.set("GLM: Request failed")
+        self._set_markdown(f"## ChatGLM request failed\n\n```\n{error_text}\n```")
 
     def _toggle_camera(self) -> None:
         """Toggle live camera on/off.
@@ -886,6 +1015,144 @@ class NetInspectorGUI:
         x_max = _x_from_h(h_max)
         self._hsv_gradient.create_line(x_min, 0, x_min, 10, fill="#0f172a", tags="marker")
         self._hsv_gradient.create_line(x_max, 0, x_max, 10, fill="#0f172a", tags="marker")
+
+    def _setup_markdown_tags(self) -> None:
+        """Configure text tags used for markdown rendering."""
+        base = tkfont.nametofont("TkDefaultFont")
+        body = base.copy()
+        code = tkfont.Font(family="Courier", size=max(9, body.cget("size")))
+        h1 = body.copy()
+        h2 = body.copy()
+        h3 = body.copy()
+        h1.configure(size=15, weight="bold")
+        h2.configure(size=13, weight="bold")
+        h3.configure(size=12, weight="bold")
+        bold = body.copy()
+        bold.configure(weight="bold")
+        italic = body.copy()
+        italic.configure(slant="italic")
+        self._md_fonts = [body, code, h1, h2, h3, bold, italic]
+
+        self.markdown_text.tag_configure("md_body", font=body, spacing3=3)
+        self.markdown_text.tag_configure("md_h1", font=h1, spacing1=8, spacing3=4)
+        self.markdown_text.tag_configure("md_h2", font=h2, spacing1=6, spacing3=3)
+        self.markdown_text.tag_configure("md_h3", font=h3, spacing1=5, spacing3=3)
+        self.markdown_text.tag_configure("md_bold", font=bold)
+        self.markdown_text.tag_configure("md_italic", font=italic)
+        self.markdown_text.tag_configure(
+            "md_code_inline",
+            font=code,
+            background="#f1f5f9",
+            foreground="#0f172a",
+        )
+        self.markdown_text.tag_configure(
+            "md_code_block",
+            font=code,
+            background="#f8fafc",
+            foreground="#0f172a",
+            lmargin1=12,
+            lmargin2=12,
+            spacing1=2,
+            spacing3=4,
+        )
+        self.markdown_text.tag_configure(
+            "md_quote",
+            foreground="#475569",
+            lmargin1=12,
+            lmargin2=18,
+            spacing1=2,
+        )
+
+    def _set_markdown(self, markdown: str) -> None:
+        """Render markdown text into the LLM pane."""
+        self.markdown_text.configure(state=tk.NORMAL)
+        self.markdown_text.delete("1.0", tk.END)
+        self._render_markdown(markdown)
+        self.markdown_text.configure(state=tk.DISABLED)
+
+    def _render_markdown(self, markdown: str) -> None:
+        in_code_block = False
+        for raw in markdown.splitlines():
+            line = raw.rstrip("\r")
+            if line.strip().startswith("```"):
+                in_code_block = not in_code_block
+                continue
+
+            if in_code_block:
+                self.markdown_text.insert(tk.END, f"{line}\n", ("md_code_block",))
+                continue
+
+            if not line.strip():
+                self.markdown_text.insert(tk.END, "\n", ("md_body",))
+                continue
+
+            head = re.match(r"^(#{1,6})\s+(.*)$", line)
+            if head:
+                level = min(len(head.group(1)), 3)
+                self._insert_inline_markdown(head.group(2), (f"md_h{level}",))
+                self.markdown_text.insert(tk.END, "\n", ("md_body",))
+                continue
+
+            quote = re.match(r"^\s*>\s?(.*)$", line)
+            if quote:
+                self.markdown_text.insert(tk.END, "│ ", ("md_quote",))
+                self._insert_inline_markdown(quote.group(1), ("md_quote", "md_body"))
+                self.markdown_text.insert(tk.END, "\n", ("md_quote",))
+                continue
+
+            bullet = re.match(r"^\s*[-*+]\s+(.*)$", line)
+            if bullet:
+                self.markdown_text.insert(tk.END, "• ", ("md_body",))
+                self._insert_inline_markdown(bullet.group(1), ("md_body",))
+                self.markdown_text.insert(tk.END, "\n", ("md_body",))
+                continue
+
+            numbered = re.match(r"^\s*(\d+)\.\s+(.*)$", line)
+            if numbered:
+                self.markdown_text.insert(tk.END, f"{numbered.group(1)}. ", ("md_body",))
+                self._insert_inline_markdown(numbered.group(2), ("md_body",))
+                self.markdown_text.insert(tk.END, "\n", ("md_body",))
+                continue
+
+            self._insert_inline_markdown(line, ("md_body",))
+            self.markdown_text.insert(tk.END, "\n", ("md_body",))
+
+    def _insert_inline_markdown(self, text: str, base_tags: tuple[str, ...]) -> None:
+        pos = 0
+        for match in self._INLINE_TOKEN_RE.finditer(text):
+            if match.start() > pos:
+                self.markdown_text.insert(tk.END, text[pos : match.start()], base_tags)
+            token = match.group(0)
+            rendered, tags = self._render_inline_token(token, base_tags)
+            self.markdown_text.insert(tk.END, rendered, tags)
+            pos = match.end()
+        if pos < len(text):
+            self.markdown_text.insert(tk.END, text[pos:], base_tags)
+
+    def _render_inline_token(
+        self, token: str, base_tags: tuple[str, ...]
+    ) -> tuple[str, tuple[str, ...]]:
+        if token.startswith("`") and token.endswith("`") and len(token) >= 2:
+            return token[1:-1], base_tags + ("md_code_inline",)
+        if token.startswith("**") and token.endswith("**") and len(token) >= 4:
+            return token[2:-2], base_tags + ("md_bold",)
+        if token.startswith("__") and token.endswith("__") and len(token) >= 4:
+            return token[2:-2], base_tags + ("md_bold",)
+        if token.startswith("*") and token.endswith("*") and len(token) >= 2:
+            return token[1:-1], base_tags + ("md_italic",)
+        if token.startswith("_") and token.endswith("_") and len(token) >= 2:
+            return token[1:-1], base_tags + ("md_italic",)
+
+        image_match = re.match(r"^!\[([^\]]*)\]\(([^)]+)\)$", token)
+        if image_match:
+            alt = image_match.group(1) or "image"
+            return f"[image: {alt}]({image_match.group(2)})", base_tags
+
+        link_match = re.match(r"^\[([^\]]+)\]\(([^)]+)\)$", token)
+        if link_match:
+            return f"{link_match.group(1)} ({link_match.group(2)})", base_tags
+
+        return token, base_tags
 
     def _on_close(self) -> None:
         """Handle window close event.
