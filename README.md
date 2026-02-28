@@ -18,14 +18,25 @@ This repository provides a segmentation-first vision GUI for the scaffolding-net
 **Architecture**
 
 ![Architecture](docs/diagrams/rendered/architecture.svg)
+Source: `docs/diagrams/architecture.dot`
 
 **Segmentation pipeline**
 
 ![Segmentation pipeline](docs/diagrams/rendered/pipeline_segmentation.svg)
+Source: `docs/diagrams/pipeline_segmentation.dot`
 
 **GUI flow**
 
 ![GUI flow](docs/diagrams/rendered/gui_flow.svg)
+Source: `docs/diagrams/gui_flow.dot`
+
+Regenerate SVGs from `.dot` sources (requires Graphviz):
+
+```bash
+dot -Tsvg docs/diagrams/architecture.dot -o docs/diagrams/rendered/architecture.svg
+dot -Tsvg docs/diagrams/pipeline_segmentation.dot -o docs/diagrams/rendered/pipeline_segmentation.svg
+dot -Tsvg docs/diagrams/gui_flow.dot -o docs/diagrams/rendered/gui_flow.svg
+```
 
 ## Quickstart (Laptop)
 
