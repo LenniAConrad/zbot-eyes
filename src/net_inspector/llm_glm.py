@@ -26,7 +26,12 @@ class ChatGLMVisionClient:
         """Return whether an API key is currently available."""
         return bool(self._read_api_key())
 
-    def infer_markdown(self, image_bgr: np.ndarray, prompt: str | None = None) -> str:
+    def infer_markdown(
+        self,
+        image_bgr: np.ndarray,
+        prompt: str | None = None,
+        model: str | None = None,
+    ) -> str:
         """Analyze an image and return markdown content."""
         api_key = self._read_api_key()
         if not api_key:
@@ -36,10 +41,15 @@ class ChatGLMVisionClient:
 
         image_data_url = self._to_image_data_url(image_bgr)
         request_prompt = prompt.strip() if prompt and prompt.strip() else self.config.default_prompt
+        request_model = model.strip() if model and model.strip() else self.config.model
 
         payload = {
-            "model": self.config.model,
+            "model": request_model,
             "messages": [
+                {
+                    "role": "system",
+                    "content": self.config.system_prompt,
+                },
                 {
                     "role": "user",
                     "content": [

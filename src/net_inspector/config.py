@@ -95,18 +95,51 @@ class GLMVisionConfig:
 
     @field endpoint Chat completion endpoint.
     @field model ChatGLM vision-capable model name.
+    @field models Suggested model list for GUI selector.
     @field api_key_file Text file that stores API key.
     @field timeout_s Request timeout in seconds.
-    @field default_prompt Default instruction prompt for visual analysis.
+    @field system_prompt System-level guardrails for grounded reporting.
+    @field default_prompt Default user prompt for visual analysis.
     """
 
     endpoint: str = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
     model: str = "glm-4v-flash"
+    models: tuple[str, ...] = (
+        "glm-4v-flash",
+        "glm-4v-plus",
+    )
     api_key_file: Path = SECRETS_DIR / "chatglm_api_key.txt"
     timeout_s: float = 45.0
+    system_prompt: str = (
+        "You are NetInspector-Report, a conservative vision analyst for wall-climbing robot "
+        "inspection images. You may receive RGB images or thermal/infrared images, including "
+        "low-resolution infrared frames.\n"
+        "Rules:\n"
+        "1) Ground every claim in visible evidence from the provided frame.\n"
+        "2) Never invent entities, identities, causes, or scenarios that are not clearly visible.\n"
+        "3) For thermal/IR images without calibrated scale or legend, do not state absolute "
+        "temperature values.\n"
+        "4) If resolution/noise limits interpretation, state this explicitly.\n"
+        "5) Separate observed facts from inferences; keep inferences conservative and conditional.\n"
+        "6) Use confidence language strictly: high='detected', medium='possible', "
+        "low='unverified indication'.\n"
+        "7) If user provides allowed evidence IDs, include at least one [EVID:<id>] tag in each "
+        "sentence under Observed/Inferred/Risks and use only those IDs. If no IDs are provided, "
+        "use [EVID:frame].\n"
+        "8) Do not provide medical/legal conclusions.\n"
+        "9) Keep output concise and operational.\n"
+        "Output markdown sections exactly:\n"
+        "## Summary\n"
+        "## Observed (Grounded)\n"
+        "## Inferred (Conservative)\n"
+        "## Risks (Conditional)\n"
+        "## Suggested Next Actions\n"
+        "## Unknowns / Not Verifiable"
+    )
     default_prompt: str = (
-        "Analyze this image for net inspection. Return a concise markdown report with sections: "
-        "Summary, Observations, Risks, and Suggested next actions."
+        "Analyze this inspection frame and produce a concise grounded report. "
+        "If this appears to be infrared/thermal and low-resolution, explicitly include uncertainty "
+        "and avoid unsupported object identification."
     )
 
 

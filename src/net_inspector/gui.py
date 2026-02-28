@@ -185,6 +185,7 @@ class NetInspectorGUI:
         self.status_var = tk.StringVar(value=self._segment_status_text())
         self._extra_status = ""
         self.report_var = tk.StringVar(value="Debris: 0.0%")
+        self.glm_model_var = tk.StringVar(value=self.config.glm_vision.model)
         self.glm_prompt_var = tk.StringVar(value=self.config.glm_vision.default_prompt)
         self.glm_status_var = tk.StringVar(value=self._glm_status_text())
         self.incident_status_var = tk.StringVar(value="Incidents: 0")
@@ -352,6 +353,18 @@ class NetInspectorGUI:
             llm_toolbar, text="Analyze current frame", command=self._on_glm_analyze
         ).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(llm_toolbar, text="Clear", command=self._on_glm_clear).pack(side=tk.LEFT)
+        ttk.Label(llm_toolbar, text="Model", style="Status.TLabel").pack(
+            side=tk.LEFT, padx=(10, 4)
+        )
+        self.glm_model_combo = ttk.Combobox(
+            llm_toolbar,
+            width=18,
+            textvariable=self.glm_model_var,
+            values=list(self.config.glm_vision.models),
+            state="normal",
+        )
+        self.glm_model_combo.pack(side=tk.LEFT, padx=(0, 6))
+        self.glm_model_combo.bind("<<ComboboxSelected>>", self._on_glm_model_change)
         ttk.Label(
             llm_toolbar, textvariable=self.glm_status_var, style="Status.TLabel"
         ).pack(side=tk.RIGHT)
@@ -487,10 +500,13 @@ class NetInspectorGUI:
 
     def _glm_status_text(self) -> str:
         """Return ChatGLM status string."""
+        model = self.glm_model_var.get().strip() if hasattr(self, "glm_model_var") else ""
+        if not model:
+            model = self.config.glm_vision.model
         if self._llm_busy:
-            return "GLM: Running..."
+            return f"GLM: Running ({model})..."
         if self.glm_client.available():
-            return f"GLM: Ready ({self.config.glm_vision.model})"
+            return f"GLM: Ready ({model})"
         return "GLM: API key missing"
 
     def _on_generate(self) -> None:
@@ -605,13 +621,18 @@ class NetInspectorGUI:
                         "the format [EVID:<id>]. Use only these IDs: "
                         f"{', '.join(evidence_ids)}."
                     )
+        model = self.glm_model_var.get().strip() or self.config.glm_vision.model
         self._llm_busy = True
         self.glm_status_var.set(self._glm_status_text())
         self._set_markdown("## Running ChatGLM request\n\nPlease wait...")
         self._llm_thread = threading.Thread(
-            target=self._glm_worker, args=(image, prompt), daemon=True
+            target=self._glm_worker, args=(image, prompt, model), daemon=True
         )
         self._llm_thread.start()
+
+    def _on_glm_model_change(self, _event=None) -> None:
+        """Refresh status when model selector changes."""
+        self.glm_status_var.set(self._glm_status_text())
 
     def _on_glm_clear(self) -> None:
         """Clear markdown pane."""
@@ -632,9 +653,9 @@ class NetInspectorGUI:
                 return self._latest_seg.copy()
         return None
 
-    def _glm_worker(self, image: np.ndarray, prompt: str) -> None:
+    def _glm_worker(self, image: np.ndarray, prompt: str, model: str) -> None:
         try:
-            markdown = self.glm_client.infer_markdown(image, prompt)
+            markdown = self.glm_client.infer_markdown(image, prompt, model=model)
         except Exception as exc:
             self.root.after(0, lambda: self._on_glm_error(str(exc)))
             return

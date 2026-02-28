@@ -73,8 +73,10 @@ python -m net_inspector.gui
 ```
 
 3. In the GUI, click **Analyze current frame** in the ChatGLM pane.
+4. Use the **Model** selector in the ChatGLM toolbar to switch GLM models at runtime.
 
-The default model endpoint is Open BigModel Chat Completions with `glm-4v-flash` and can be adjusted in `src/net_inspector/config.py`.
+The default model endpoint is Open BigModel Chat Completions with `glm-4v-flash`.
+You can edit the selectable model list in `src/net_inspector/config.py` (`GLMVisionConfig.models`).
 
 ## Grounded Incident Reports (RGB + Thermal)
 
